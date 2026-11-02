@@ -13,16 +13,21 @@ Dua mode:
 Tool ini TIDAK PERNAH menghapus, memindah, atau mengubah file asli.
 Opsi --pisah hanya menyalin (bukan memindah) file-file duplikat ke
 subfolder duplikat_persis/ dan foto_mirip/ untuk ditinjau manual.
+Folder bersih adalah hasil akhir yang sudah bersih dari duplikat:
+berisi file yang tidak masuk grup mana pun, ditambah satu perwakilan
+dari tiap grup duplikat (anggota pertama grup seperti tercantum di
+laporan). Folder grup tetap berisi semua anggota sebagai arsip peninjauan.
 
 Pemakaian:
-  python3 deteksi_file_double.py <folder>
-  python3 deteksi_file_double.py <folder> --mirip
-  python3 deteksi_file_double.py <folder> --mirip --jarak 3 --pisah
-  python3 deteksi_file_double.py <folder> --no-rekursif --output hasil.xlsx --csv hasil.csv
+  python3 deteksi_file_double_bersih.py <folder>
+  python3 deteksi_file_double_bersih.py <folder> --mirip
+  python3 deteksi_file_double_bersih.py <folder> --mirip --jarak 3 --pisah
+  python3 deteksi_file_double_bersih.py <folder> --no-rekursif --output hasil.xlsx --csv hasil.csv
 
 Bawaan: pemindaian rekursif (termasuk subfolder). Laporan CSV dan Excel
-ditulis di dalam folder input. Folder hasil --pisah dari proses
-sebelumnya dilewati agar salinan tidak ikut terhitung duplikat.
+ditulis di dalam folder input, ditambah CSV tersendiri untuk file bersih.
+Folder hasil --pisah dan laporan dari proses sebelumnya dilewati agar
+salinan tidak ikut terhitung duplikat.
 
 Kebutuhan: python3, Pillow. Excel butuh openpyxl; tanpa itu, CSV tetap dibuat.
 """
@@ -37,7 +42,7 @@ import sys
 from PIL import Image
 
 IMG_EXTS = {'.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp', '.tif', '.tiff'}
-LEWATI_DIR = {'duplikat_persis', 'foto_mirip',
+LEWATI_DIR = {'duplikat_persis', 'foto_mirip', 'bersih',
               'watermark', 'bukan_watermark', 'ragu_ragu'}
 
 
@@ -99,18 +104,20 @@ class UnionFind:
             self.ortu[rb] = ra
 
 
-def kumpulkan_file(folder, rekursif):
+def kumpulkan_file(folder, rekursif, lewati_file=frozenset()):
     hasil = []
     if rekursif:
         for akar, dirs, files in os.walk(folder):
             dirs[:] = sorted(d for d in dirs if d not in LEWATI_DIR)
             for nama in sorted(files):
                 p = os.path.join(akar, nama)
+                if os.path.abspath(p) in lewati_file:
+                    continue
                 hasil.append((p, os.path.relpath(p, folder)))
     else:
         for nama in sorted(os.listdir(folder)):
             p = os.path.join(folder, nama)
-            if os.path.isfile(p):
+            if os.path.isfile(p) and os.path.abspath(p) not in lewati_file:
                 hasil.append((p, nama))
     return hasil
 
@@ -124,7 +131,15 @@ def tulis_csv(path, baris):
             w.writerow(b)
 
 
-def tulis_excel(path, grup_persis, grup_mirip, ringkasan):
+def tulis_csv_bersih(path, bersih_final):
+    with open(path, 'w', newline='', encoding='utf-8') as f:
+        w = csv.writer(f)
+        w.writerow(['No', 'File', 'Ukuran (byte)', 'MD5', 'Perwakilan grup'])
+        for i, (a, wak) in enumerate(bersih_final, 1):
+            w.writerow([i, a['rel'], a['ukuran'], a['hash'], wak])
+
+
+def tulis_excel(path, grup_persis, grup_mirip, bersih, ringkasan):
     try:
         import openpyxl
     except ImportError:
@@ -144,6 +159,10 @@ def tulis_excel(path, grup_persis, grup_mirip, ringkasan):
             for item in g['anggota']:
                 ws2.append([g['nama'], item['rel'], item['ukuran'],
                             item['hash'], item['jarak']])
+    wsb = wb.create_sheet('File Bersih')
+    wsb.append(['No', 'File', 'Ukuran (byte)', 'MD5', 'Perwakilan grup'])
+    for i, (a, wak) in enumerate(bersih, 1):
+        wsb.append([i, a['rel'], a['ukuran'], a['hash'], wak])
     ws3 = wb.create_sheet('Ringkasan')
     for k, v in ringkasan:
         ws3.append([k, v])
@@ -174,7 +193,18 @@ def main():
         return 1
     jarak = max(0, min(64, args.jarak))
 
-    daftar = kumpulkan_file(folder, not args.no_rekursif)
+    # Laporan ditulis di folder ini juga, jadi dikecualikan dari pemindaian
+    # (laporan akan ditimpa; laporan lama tidak boleh ikut terhitung).
+    out_csv = args.csv or os.path.join(folder, 'hasil_file_double.csv')
+    out_xlsx = args.output or os.path.join(folder, 'hasil_file_double.xlsx')
+    akar_csv, ekst_csv = os.path.splitext(out_csv)
+    out_csv_bersih = akar_csv + '_bersih' + ekst_csv
+    lewati_file = {os.path.abspath(p) for p in
+                   (out_csv, out_xlsx, out_csv_bersih,
+                    os.path.join(folder, 'hasil_file_double.csv'),
+                    os.path.join(folder, 'hasil_file_double.xlsx'),
+                    os.path.join(folder, 'hasil_file_double_bersih.csv'))}
+    daftar = kumpulkan_file(folder, not args.no_rekursif, lewati_file)
     print(f'Memindai {len(daftar)} file di {folder} ...', flush=True)
 
     # --- Duplikat persis (MD5) ---
@@ -200,6 +230,7 @@ def main():
 
     # --- Foto mirip (dHash) ---
     grup_mirip = None
+    gagal_mirip = []
     if args.mirip:
         gambar = []
         for p, rel in daftar:
@@ -207,6 +238,7 @@ def main():
                 continue
             h = dhash_file(p)
             if h is None:
+                gagal_mirip.append(rel)
                 continue
             gambar.append({'path': p, 'rel': rel,
                            'ukuran': os.path.getsize(p), 'hash': h})
@@ -232,6 +264,41 @@ def main():
         for i, g in enumerate(grup_mirip, 1):
             g['nama'] = f'M{i:02d}'
 
+    # --- File bersih: berhasil dibaca tapi tidak masuk grup mana pun ---
+    # (gambar yang gagal dihitung dHash tidak dihitung bersih bila --mirip,
+    # karena kemiripannya tidak diketahui; ia dilaporkan terpisah.)
+    rel_grup = set()
+    for g in grup_persis:
+        rel_grup.update(a['rel'] for a in g['anggota'])
+    if grup_mirip:
+        rel_grup.update(a['rel'] for g in grup_mirip for a in g['anggota'])
+    set_gagal_mirip = set(gagal_mirip)
+    bersih = []
+    for anggota in per_md5.values():
+        for a in anggota:
+            if a['rel'] not in rel_grup and a['rel'] not in set_gagal_mirip:
+                bersih.append(a)
+    bersih.sort(key=lambda a: a['rel'])
+
+    # --- Perwakilan grup: satu file per grup ikut ke folder bersih ---
+    # Perwakilan = anggota pertama grup seperti tercantum di laporan
+    # (grup persis: urutan nama file; grup mirip: urutan jarak lalu nama).
+    # Satu file hanya satu baris di bersih walau mewakili beberapa grup.
+    perwakilan = {}
+    for g in grup_persis:
+        perwakilan.setdefault(g['anggota'][0]['rel'], []).append(g['nama'])
+    if grup_mirip:
+        for g in grup_mirip:
+            perwakilan.setdefault(g['anggota'][0]['rel'], []).append(g['nama'])
+    by_rel = {}
+    for anggota in per_md5.values():
+        for a in anggota:
+            by_rel[a['rel']] = a
+    bersih_final = [(a, '-') for a in bersih]
+    for rel, nama_grup in sorted(perwakilan.items()):
+        bersih_final.append((by_rel[rel], ', '.join(nama_grup)))
+    bersih_final.sort(key=lambda t: t[0]['rel'])
+
     # --- Laporan ---
     baris_csv = []
     for g in grup_persis:
@@ -243,9 +310,8 @@ def main():
             for a in g['anggota']:
                 baris_csv.append(['Foto mirip', g['nama'], a['rel'],
                                   a['ukuran'], a['hash'], a['jarak']])
-    out_csv = args.csv or os.path.join(folder, 'hasil_file_double.csv')
-    out_xlsx = args.output or os.path.join(folder, 'hasil_file_double.xlsx')
     tulis_csv(out_csv, baris_csv)
+    tulis_csv_bersih(out_csv_bersih, bersih_final)
     ringkasan = [
         ('Total file dipindai', len(daftar)),
         ('Grup duplikat persis', len(grup_persis)),
@@ -259,13 +325,26 @@ def main():
              sum(len(g['anggota']) for g in grup_mirip)),
             ('Ambang jarak dHash', jarak),
         ]
+    ringkasan.append(('File bersih (hasil akhir)', len(bersih_final)))
+    if args.mirip:
+        ringkasan.append(('Arti bersih', 'File tanpa duplikat + satu '
+                                        'perwakilan dari tiap grup '
+                                        '(persis & mirip)'))
+    else:
+        ringkasan.append(('Arti bersih', 'File tanpa duplikat persis + '
+                                        'satu perwakilan dari tiap grup '
+                                        'duplikat persis (kemiripan visual '
+                                        'tidak diperiksa tanpa --mirip)'))
+    ringkasan.append(('Gambar gagal dihitung dHash', len(gagal_mirip)))
+    for rel in gagal_mirip:
+        ringkasan.append(('Gagal dHash', rel))
     ringkasan.append(('File gagal dibaca', len(gagal)))
     for rel in gagal:
         ringkasan.append(('Gagal dibaca', rel))
     ringkasan.append(('Catatan', 'MD5 sama = isi identik persis. dHash = kemiripan '
                                  'visual; jarak 0 identik, makin kecil makin mirip. '
                                  'File asli tidak diubah/dihapus.'))
-    ok_xlsx = tulis_excel(out_xlsx, grup_persis, grup_mirip, ringkasan)
+    ok_xlsx = tulis_excel(out_xlsx, grup_persis, grup_mirip, bersih_final, ringkasan)
 
     # --- Pisah (salinan saja) ---
     if args.pisah:
@@ -280,6 +359,10 @@ def main():
                     t = os.path.join(folder, 'foto_mirip', g['nama'], a['rel'])
                     os.makedirs(os.path.dirname(t), exist_ok=True)
                     shutil.copy2(a['path'], t)
+        for a, _wak in bersih_final:
+            t = os.path.join(folder, 'bersih', a['rel'])
+            os.makedirs(os.path.dirname(t), exist_ok=True)
+            shutil.copy2(a['path'], t)
 
     print(f"\nSELESAI: {len(daftar)} file dipindai | "
           f"duplikat persis: {len(grup_persis)} grup "
@@ -287,12 +370,14 @@ def main():
           + (f" | foto mirip: {len(grup_mirip)} grup "
              f"({sum(len(g['anggota']) for g in grup_mirip)} file)"
              if grup_mirip is not None else '')
+          + f" | bersih: {len(bersih_final)} file"
           + f" | gagal dibaca: {len(gagal)}")
     print(f'CSV: {out_csv}')
+    print(f'CSV bersih: {out_csv_bersih}')
     print(f"Excel: {out_xlsx if ok_xlsx else '(openpyxl tidak ada, Excel dilewati)'}")
     if args.pisah:
-        print('Grup disalin (bukan dipindah) ke subfolder duplikat_persis/ '
-              'dan foto_mirip/.')
+        print('Grup disalin (bukan dipindah) ke subfolder duplikat_persis/, '
+              'foto_mirip/, dan bersih/.')
     if gagal:
         print('File gagal dibaca:', ', '.join(gagal))
     return 0
